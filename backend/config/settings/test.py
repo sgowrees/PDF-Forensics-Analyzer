@@ -1,0 +1,14 @@
+from .base import *  # noqa
+
+DEBUG = True
+
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": ":memory:",
+    }
+}
+
+EMAIL_BACKEND = "django.core.mail.backends.locmem.EmailBackend"
+
+ACCOUNT_EMAIL_VERIFICATION = "none"

@@ -1,0 +1,66 @@
+[project]
+name = "my_awesome_project"
+version = "0.1.0"
+description = "Behold My Awesome Project!"
+readme = "README.md"
+license = { text = "MIT" }
+
+authors = [
+  { name = "Daniel Roy Greenfeld", email = "daniel-roy-greenfeld@example.com" },
+]
+
+requires-python = "==3.14.*"
+
+classifiers = [
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.14",
+]
+
+dependencies = [
+  "django==6.0.5",
+  "django-allauth[headless]==65.17.0",
+  "django-cors-headers>=4.9.0",
+  "django-environ>=0.13.0",
+  "djangorestframework>=3.17.1",
+  "pillow==12.2.0",
+  "requests>=2.34.2",
+  "whitenoise==6.12.0",
+  "pymupdf>=1.24.0",
+  "pdfplumber>=0.11.0",
+  "pdfminer.six>=20231228",
+  "reportlab>=4.5.1",
+]
+
+[dependency-groups]
+dev = [
+  "django-debug-toolbar==6.3.0",
+  "factory-boy>=3.3.3",
+  "pytest>=9.0.3",
+  "pytest-django>=4.12.0",
+  "pytest-factoryboy>=2.8.1",
+  "ruff==0.15.14",
+]
+
+[tool.ruff]
+extend-exclude = [
+  "*/migrations/*.py",
+  "staticfiles/*",
+]
+
+lint.select = [
+  "E",
+  "F",
+  "I",
+]
+
+line-length = 88
+
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings.test"
+minversion = "6.0"
+python_files = [
+  "tests.py",
+  "test_*.py",
+]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
