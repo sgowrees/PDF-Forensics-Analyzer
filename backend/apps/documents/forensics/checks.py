@@ -1,5 +1,6 @@
 import re
 import unicodedata
+from collections import Counter
 from datetime import datetime
 
 import fitz
@@ -21,6 +22,136 @@ MALICIOUS_PATTERNS = {
     r"/EmbeddedFiles": ("Hidden embedded files or binary payload attachments", 45),
     r"/XFA":           ("XML Forms Architecture (highly prone to structural obfuscation)", 20),
 }
+
+# PyMuPDF span flag bits
+_FLAG_BOLD      = 1 << 4   # 16
+_FLAG_ITALIC    = 1 << 1   # 2
+_FLAG_STRIKEOUT = 1 << 7   # 128
+_FLAG_UNDERLINE = 1 << 2   # 4
+_FORMATTING_FLAGS = _FLAG_BOLD | _FLAG_ITALIC | _FLAG_STRIKEOUT | _FLAG_UNDERLINE
+
+# Annotation subtypes that indicate hand-editing
+_MARKUP_ANNOTS  = {"StrikeOut", "Highlight", "Underline", "Squiggly"}
+_DRAWING_ANNOTS = {"Ink", "Line", "Square", "Circle", "Polygon", "PolyLine",
+                   "FreeText", "Stamp", "FileAttachment", "Text"}
+_ALL_ANNOTS     = _MARKUP_ANNOTS | _DRAWING_ANNOTS
+
+
+# ---------------------------------------------------------------------------
+# HELPERS — read annotations/drawings/spans directly from a PDF path
+# ---------------------------------------------------------------------------
+
+def _read_annot_counts(pdf_path: str) -> list[Counter]:
+    """
+    Returns a list (one Counter per page) mapping annotation subtype → count.
+    Reads directly from fitz so it's never stale.
+    """
+    result = []
+    try:
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            c: Counter = Counter()
+            try:
+                for annot in page.annots() or []:
+                    subtype = annot.type[1]
+                    if subtype in _ALL_ANNOTS:
+                        c[subtype] += 1
+            except Exception:
+                pass
+            result.append(c)
+        doc.close()
+    except Exception:
+        pass
+    return result
+
+
+def _read_drawing_counts(pdf_path: str) -> list[int]:
+    """
+    Returns a list (one int per page) of non-trivial vector drawing path counts,
+    excluding drawings that fall inside form field widget boundaries
+    (e.g. checkbox checkmarks, radio-button fills).
+    Reads directly from fitz.
+    """
+    result = []
+    try:
+        doc = fitz.open(pdf_path)
+        for page in doc:
+            try:
+                # Collect widget rects so we can exclude checkbox/radio drawings
+                widget_rects = []
+                for w in (page.widgets() or []):
+                    try:
+                        wr = w.rect
+                        if not wr.is_empty:
+                            widget_rects.append(wr)
+                    except Exception:
+                        pass
+
+                count = sum(
+                    1 for p in page.get_drawings()
+                    if p.get("rect")
+                    and p["rect"].width >= 1
+                    and p["rect"].height >= 1
+                    and not any(p["rect"].intersects(wr) for wr in widget_rects)
+                )
+            except Exception:
+                count = 0
+            result.append(count)
+        doc.close()
+    except Exception:
+        pass
+    return result
+
+
+def _read_formatting_from_path(pdf_path: str) -> dict[int, list[dict]]:
+    """
+    Opens a PDF and returns {page_index: [span_dict, ...]} for every span.
+    Called on both upload and baseline so comparison is always apples-to-apples.
+    """
+    result: dict[int, list[dict]] = {}
+    try:
+        doc = fitz.open(pdf_path)
+        for pi in range(len(doc)):
+            spans = []
+            for blk in doc[pi].get_text(
+                "dict", flags=fitz.TEXT_PRESERVE_WHITESPACE
+            ).get("blocks", []):
+                if blk.get("type") != 0:
+                    continue
+                for line in blk.get("lines", []):
+                    for span in line.get("spans", []):
+                        flags = span.get("flags", 0)
+                        text  = span.get("text", "").strip()
+                        if not text:
+                            continue
+                        spans.append({
+                            "text":      text,
+                            "bold":      bool(flags & _FLAG_BOLD),
+                            "italic":    bool(flags & _FLAG_ITALIC),
+                            "strikeout": bool(flags & _FLAG_STRIKEOUT),
+                            "underline": bool(flags & _FLAG_UNDERLINE),
+                            "flags":     flags,
+                        })
+            result[pi] = spans
+        doc.close()
+    except Exception:
+        pass
+    return result
+
+
+def _formatting_fingerprints(spans: list[dict]) -> set[tuple]:
+    """Fingerprint set for spans that carry at least one formatting flag."""
+    fps = set()
+    for span in spans:
+        if any((span["bold"], span["italic"], span["strikeout"], span["underline"])):
+            fps.add((
+                truncate(span["text"], 60),
+                span["bold"],
+                span["italic"],
+                span["strikeout"],
+                span["underline"],
+            ))
+    return fps
 
 
 # ---------------------------------------------------------------------------
@@ -52,21 +183,10 @@ def check_metadata(pdf_path: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# LAYOUT — only flags issues NEW in upload vs baseline
+# LAYOUT
 # ---------------------------------------------------------------------------
 
 def check_layout(extracted: dict, baseline: dict | None = None) -> dict:
-    """
-    Checks for layout anomalies that exist in the UPLOAD but NOT the baseline.
-
-    The key fix: every check runs on both upload and baseline.
-    Only differences are reported. If the baseline has the same gap,
-    overlap, or misalignment, it is normal for that document — not a finding.
-
-    Args:
-        extracted: extractor output for the upload.
-        baseline:  extractor output for the baseline (or None).
-    """
     issues, score = [], 0
 
     upload_pages   = extracted.get("pages", [])
@@ -80,9 +200,7 @@ def check_layout(extracted: dict, baseline: dict | None = None) -> dict:
         if len(upload_blocks) < 2:
             continue
 
-        # --- Overlapping blocks ---
-        # Only flag overlaps that are present in upload but NOT in baseline
-        up_fields = page.get("form_fields", [])
+        up_fields   = page.get("form_fields", [])
         base_fields = baseline_pages[idx].get("form_fields", []) if idx < len(baseline_pages) else []
         upload_overlaps = _find_overlaps(upload_blocks, up_fields)
         base_overlaps   = _find_overlaps(base_blocks, base_fields)
@@ -95,8 +213,6 @@ def check_layout(extracted: dict, baseline: dict | None = None) -> dict:
             )
             score += 5
 
-        # --- Irregular vertical gaps ---
-        # Only flag gaps that are LARGER than any gap in the baseline
         if len(upload_blocks) >= 5:
             upload_gaps = _get_gaps(upload_blocks)
             base_gaps   = _get_gaps(base_blocks)
@@ -107,9 +223,7 @@ def check_layout(extracted: dict, baseline: dict | None = None) -> dict:
                 gap = ordered[i]["y0"] - ordered[i - 1]["y1"]
                 if gap <= 0:
                     continue
-
                 if max_base is not None:
-                    # Only flag if this gap is meaningfully larger than the biggest baseline gap
                     if gap > max_base * 1.3 and gap > 30:
                         issues.append(
                             f"Page {n}: vertical gap ({gap:.0f}pt) larger than "
@@ -119,7 +233,6 @@ def check_layout(extracted: dict, baseline: dict | None = None) -> dict:
                         )
                         score += 2
                 else:
-                    # No baseline — fall back to statistical outlier detection
                     if upload_gaps:
                         med = sorted(upload_gaps)[len(upload_gaps) // 2]
                         if gap > max(med * 4, 30):
@@ -133,7 +246,6 @@ def check_layout(extracted: dict, baseline: dict | None = None) -> dict:
 
 
 def _find_overlaps(blocks: list, form_fields: list | None = None) -> list[tuple]:
-    """Returns list of (text_a, text_b) pairs for overlapping static blocks."""
     fields = form_fields or []
     pairs = []
     for i, a in enumerate(blocks):
@@ -150,7 +262,6 @@ def _find_overlaps(blocks: list, form_fields: list | None = None) -> list[tuple]
 
 
 def _get_gaps(blocks: list) -> list[float]:
-    """Returns list of positive vertical gaps between sorted blocks."""
     if len(blocks) < 2:
         return []
     ordered = sorted(blocks, key=lambda b: b["y0"])
@@ -162,73 +273,204 @@ def _get_gaps(blocks: list) -> list[float]:
 
 
 # ---------------------------------------------------------------------------
-# IMAGES
+# IMAGES + ANNOTATIONS + DRAWINGS
+# Reads everything directly from fitz for BOTH upload and baseline.
 # ---------------------------------------------------------------------------
 
-def check_images(extracted: dict, baseline: dict | None = None) -> dict:
+def check_images(
+    extracted: dict,
+    baseline: dict | None = None,
+    pdf_path: str | None = None,
+    baseline_pdf_path: str | None = None,
+) -> dict:
     issues, score = [], 0
-    base_pages = baseline.get("pages", []) if baseline else []
-    for idx, page in enumerate(extracted.get("pages", [])):
-        n = idx + 1
-        images, blocks = page.get("images", []), page.get("text_blocks", [])
-        pw, ph = page.get("width", 595), page.get("height", 842)
-        base_n = len(base_pages[idx].get("images", [])) if idx < len(base_pages) else 0
-        extra = len(images) - base_n
+    base_pages = (baseline or {}).get("pages", [])
+
+    # Pre-read baseline annotations/drawings directly from its PDF.
+    # We never trust the stored extracted dict for the baseline because it
+    # may be stale or was extracted before these fields were added.
+    base_annot_counts: list[Counter] = (
+        _read_annot_counts(baseline_pdf_path) if baseline_pdf_path else []
+    )
+    base_drawing_counts: list[int] = (
+        _read_drawing_counts(baseline_pdf_path) if baseline_pdf_path else []
+    )
+
+    if not pdf_path:
+        # Fallback: extractor data only, no annotation/drawing detection
+        upload_pages = extracted.get("pages", [])
+        for idx, page in enumerate(upload_pages):
+            n      = idx + 1
+            images = page.get("images", [])
+            base_n = len(base_pages[idx].get("images", [])) if idx < len(base_pages) else 0
+            extra  = len(images) - base_n
+            if extra > 0:
+                issues.append(f"Page {n}: {extra} unexpected image(s) vs baseline")
+                score += extra * 5
+        return module_result(issues, score, cap=20)
+
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        return module_result([f"Failed to open PDF: {e}"], 10)
+
+    upload_pages = extracted.get("pages", [])
+
+    for idx in range(len(doc)):
+        page   = doc[idx]
+        n      = idx + 1
+        pw, ph = page.rect.width, page.rect.height
+        area   = pw * ph or 1
+
+        ext_page    = upload_pages[idx] if idx < len(upload_pages) else {}
+        base_page   = base_pages[idx]   if idx < len(base_pages)   else {}
+        text_blocks = ext_page.get("text_blocks", [])
+
+        # ── Embedded images ─────────────────────────────────────────────────
+        images = []
+        seen   = set()
+        for img_info in page.get_images(full=True):
+            xref = img_info[0]
+            if xref in seen:
+                continue
+            seen.add(xref)
+            for rect in page.get_image_rects(xref):
+                images.append({
+                    "x0": rect.x0, "y0": rect.y0,
+                    "x1": rect.x1, "y1": rect.y1,
+                    "width": rect.width, "height": rect.height,
+                })
+
+        base_n = len(base_page.get("images", []))
+        extra  = len(images) - base_n
         if extra > 0:
             issues.append(f"Page {n}: {extra} unexpected image(s) vs baseline")
             score += extra * 5
-        area = pw * ph or 1
+
         for img in images:
-            if img["width"] * img["height"] / area >= 0.85:
+            iw, ih = img["width"], img["height"]
+            if iw * ih / area >= 0.85:
                 issues.append(f"Page {n}: near-full-page image (possible screenshot replacement)")
                 score += 10
-            if img["width"] > pw * 0.6 and 5 < img["height"] < 30:
+            if iw > pw * 0.6 and 5 < ih < 30:
                 issues.append(f"Page {n}: suspicious covering-strip image")
                 score += 5
-            if (img["x1"] - img["x0"]) < 10 or (img["y1"] - img["y0"]) < 10:
+            if iw < 10 or ih < 10:
                 continue
-            for block in blocks:
+            for block in text_blocks:
                 if bbox_overlap(img, block):
                     issues.append(
                         f"Page {n}: image overlaps text '{truncate(block.get('text', ''))}'"
                     )
                     score += 8
                     break
+
+        # ── Annotations ──────────────────────────────────────────────────────
+        upload_annot_counts: Counter = Counter()
+        try:
+            for annot in page.annots() or []:
+                subtype = annot.type[1]
+                if subtype in _ALL_ANNOTS:
+                    upload_annot_counts[subtype] += 1
+        except Exception:
+            pass
+
+        if base_annot_counts:
+            base_page_annot_counts: Counter = (
+                base_annot_counts[idx] if idx < len(base_annot_counts) else Counter()
+            )
+        else:
+            base_page_annot_counts = Counter(
+                a["subtype"] if isinstance(a, dict) else a
+                for a in base_page.get("annotations", [])
+            )
+
+        for subtype, upload_count in upload_annot_counts.items():
+            base_count  = base_page_annot_counts.get(subtype, 0)
+            extra_count = upload_count - base_count
+            if extra_count <= 0:
+                continue
+            if subtype in _DRAWING_ANNOTS:
+                issues.append(
+                    f"Page {n}: {extra_count} new '{subtype}' annotation(s) added (not in baseline)"
+                )
+                score += extra_count * 6
+            elif subtype in _MARKUP_ANNOTS:
+                issues.append(
+                    f"Page {n}: {extra_count} new '{subtype}' markup annotation(s) (not in baseline)"
+                )
+                score += extra_count * 4
+
+        # ── Vector drawings / scribbles ──────────────────────────────────────
+        # Exclude drawings that overlap form field widgets (checkbox marks,
+        # radio-button fills, etc.) so ticking a checkbox is never flagged.
+        try:
+            widget_rects = []
+            for w in (page.widgets() or []):
+                try:
+                    wr = w.rect
+                    if not wr.is_empty:
+                        widget_rects.append(wr)
+                except Exception:
+                    pass
+
+            upload_drawing_count = sum(
+                1 for p in page.get_drawings()
+                if p.get("rect")
+                and p["rect"].width >= 1
+                and p["rect"].height >= 1
+                and not any(p["rect"].intersects(wr) for wr in widget_rects)
+            )
+        except Exception:
+            upload_drawing_count = 0
+
+        if base_drawing_counts:
+            base_drawing_count = (
+                base_drawing_counts[idx] if idx < len(base_drawing_counts) else 0
+            )
+        else:
+            base_drawing_count = len(base_page.get("drawings", []))
+
+        extra_drawings = upload_drawing_count - base_drawing_count
+        if extra_drawings > 0:
+            issues.append(
+                f"Page {n}: {extra_drawings} new vector drawing(s)/scribble(s) vs baseline"
+            )
+            score += extra_drawings * 4
+
+    doc.close()
     return module_result(issues, score, cap=20)
 
 
 # ---------------------------------------------------------------------------
-# TEXT — only flags anomalies NEW in upload vs baseline
+# TEXT — fragmentation, encoding, invisible chars, span formatting
+# Reads formatting directly from fitz for BOTH upload and baseline.
 # ---------------------------------------------------------------------------
 
-def check_text(extracted: dict, baseline: dict | None = None) -> dict:
-    """
-    Checks for text anomalies that exist in the UPLOAD but NOT the baseline.
-
-    The key fix: we measure the same metrics on both upload and baseline,
-    then only report the DIFFERENCE. If the baseline already has 6 single-char
-    blocks, those are normal for this document — only extras are flagged.
-
-    Args:
-        extracted: extractor output for the upload.
-        baseline:  extractor output for the baseline (or None).
-    """
+def check_text(
+    extracted: dict,
+    baseline: dict | None = None,
+    pdf_path: str | None = None,
+    baseline_pdf_path: str | None = None,
+) -> dict:
     issues, score = [], 0
 
     upload_pages   = extracted.get("pages", [])
     baseline_pages = (baseline or {}).get("pages", [])
+
+    # Read span-level formatting directly from both PDFs.
+    upload_fmt   = _read_formatting_from_path(pdf_path)          if pdf_path          else {}
+    baseline_fmt = _read_formatting_from_path(baseline_pdf_path) if baseline_pdf_path else {}
 
     for idx, page in enumerate(upload_pages):
         n             = idx + 1
         upload_blocks = page.get("text_blocks", [])
         base_blocks   = baseline_pages[idx].get("text_blocks", []) if idx < len(baseline_pages) else []
 
-        # --- Fragmentation ---
+        # ── Fragmentation ───────────────────────────────────────────────────
         upload_max = _max_consecutive_singles(upload_blocks)
         base_max   = _max_consecutive_singles(base_blocks)
         extra      = upload_max - base_max
-
-        # Only flag if upload has ≥5 MORE single-char blocks than baseline
         if upload_max >= 5 and extra >= 5:
             issues.append(
                 f"Page {n}: text fragmentation — {upload_max} consecutive "
@@ -237,34 +479,76 @@ def check_text(extracted: dict, baseline: dict | None = None) -> dict:
             )
             score += 5
 
-        # --- Encoding anomalies ---
+        # ── Encoding anomalies ──────────────────────────────────────────────
         upload_bad = _encoding_anomaly_texts(upload_blocks)
         base_bad   = _encoding_anomaly_texts(base_blocks)
-        new_bad    = upload_bad - base_bad   # texts in upload but not baseline
-
-        for sample in new_bad:
+        for sample in upload_bad - base_bad:
             issues.append(f"Page {n}: encoding anomaly not in baseline — '{sample}'")
-        if new_bad:
+        if upload_bad - base_bad:
             score += 5
 
-        # --- Invisible whitespace ---
+        # ── Invisible whitespace ────────────────────────────────────────────
         upload_ws = _invisible_whitespace_chars(upload_blocks)
         base_ws   = _invisible_whitespace_chars(base_blocks)
-        new_ws    = upload_ws - base_ws   # chars in upload but not baseline
-
-        for char_name in new_ws:
+        for char_name in upload_ws - base_ws:
             issues.append(
                 f"Page {n}: invisible character not in baseline — {char_name} "
                 "(can be used to visually pad values)"
             )
-        if new_ws:
+        if upload_ws - base_ws:
             score += 3
+
+        # ── Span formatting (bold / italic / strikethrough / underline) ─────
+        upload_spans   = upload_fmt.get(idx, [])
+        baseline_spans = baseline_fmt.get(idx, [])
+
+        if baseline_spans:
+            base_fps = _formatting_fingerprints(baseline_spans)
+        else:
+            base_fps = _formatting_fingerprints_from_blocks(base_blocks)
+
+        for span in upload_spans:
+            fp = (
+                truncate(span["text"], 60),
+                span["bold"],
+                span["italic"],
+                span["strikeout"],
+                span["underline"],
+            )
+            if fp in base_fps:
+                continue
+            tags = [k for k in ("bold", "italic", "strikeout", "underline") if span[k]]
+            if tags:
+                issues.append(
+                    f"Page {n}: text '{truncate(span['text'])}' has unexpected "
+                    f"formatting ({', '.join(tags)}) not present in baseline"
+                )
+                score += 4
 
     return module_result(issues, score, cap=15)
 
 
+def _formatting_fingerprints_from_blocks(blocks: list) -> set[tuple]:
+    """Fallback: build formatting fingerprints from extractor block → span dicts."""
+    fps = set()
+    for b in blocks:
+        for span in b.get("spans", []):
+            text = span.get("text", "").strip()
+            if not text:
+                continue
+            fp = (
+                truncate(text, 60),
+                bool(span.get("bold")),
+                bool(span.get("italic")),
+                bool(span.get("strikeout")),
+                bool(span.get("underline")),
+            )
+            if any(fp[1:]):
+                fps.add(fp)
+    return fps
+
+
 def _max_consecutive_singles(blocks: list) -> int:
-    """Returns the maximum run of consecutive single-character text blocks."""
     max_run = current = 0
     for b in blocks:
         t = b.get("text", "").strip()
@@ -277,7 +561,6 @@ def _max_consecutive_singles(blocks: list) -> int:
 
 
 def _encoding_anomaly_texts(blocks: list) -> set[str]:
-    """Returns set of truncated text snippets that have encoding anomalies."""
     bad = set()
     for b in blocks:
         text = b.get("text", "")
@@ -288,12 +571,10 @@ def _encoding_anomaly_texts(blocks: list) -> set[str]:
 
 
 def _invisible_whitespace_chars(blocks: list) -> set[str]:
-    """Returns set of invisible whitespace character names found in blocks."""
     found = set()
     for b in blocks:
-        text = b.get("text", "")
         for ch in INVISIBLE_WS:
-            if ch in text:
+            if ch in b.get("text", ""):
                 found.add(unicodedata.name(ch, f"U+{ord(ch):04X}"))
     return found
 
@@ -314,9 +595,9 @@ def check_signatures(pdf_path: str) -> dict:
             if "sig" not in ft and "signature" not in ft:
                 continue
             has_sig = True
-            obj = doc.xref_object(annot.xref)
+            obj    = doc.xref_object(annot.xref)
             signed = "/V" in obj and "/V null" not in obj
-            ok = signed and "/ByteRange" in obj
+            ok     = signed and "/ByteRange" in obj
             sigs.append({"page": pi + 1, "is_signed": signed, "is_valid": ok if signed else None})
             if signed and not ok:
                 valid = False
@@ -339,9 +620,7 @@ def check_signatures(pdf_path: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def check_malicious(pdf_path: str) -> dict:
-    """Scans the PDF object structure for exploit vectors and malicious payloads."""
-    issues, score = [], 0
-    raw_data = {}
+    issues, score, raw_data = [], 0, {}
     try:
         with open(pdf_path, "rb") as f:
             content = f.read()
@@ -349,7 +628,6 @@ def check_malicious(pdf_path: str) -> dict:
         return module_result([f"Failed to read file for structural analysis: {str(e)}"], 50)
 
     content_str = content.decode("latin-1", errors="ignore")
-
     for pattern, (description, weight) in MALICIOUS_PATTERNS.items():
         matches = len(re.findall(pattern, content_str))
         if matches > 0:
@@ -361,11 +639,10 @@ def check_malicious(pdf_path: str) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# STRUCTURE (shadow attacks, multiple roots)
+# STRUCTURE
 # ---------------------------------------------------------------------------
 
 def check_structure(pdf_path: str) -> dict:
-    """Detects incremental update shadow attacks and parser-confusion techniques."""
     issues, score = [], 0
     try:
         with open(pdf_path, "rb") as f:
@@ -409,4 +686,3 @@ def _pdf_date(s: str) -> datetime | None:
         except ValueError:
             continue
     return None
-

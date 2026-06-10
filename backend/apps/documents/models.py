@@ -1,3 +1,4 @@
+
 import uuid
 from django.db import models
 
@@ -13,10 +14,7 @@ class Document(models.Model):
     
 
     class DocumentType(models.TextChoices):
-        INVOICE = "invoice", "Invoice"
-        BANK_STATEMENT = "bank_statement", "Bank Statement"
-        PAYSLIP = "payslip", "Payslip"
-        CERTIFICATE = "certificate", "Certificate"
+        DOCUMENT = "document", "Document"
         UNKNOWN = "unknown", "Unknown"
 
     class AnalysisStatus(models.TextChoices):
