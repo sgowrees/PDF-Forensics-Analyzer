@@ -15,7 +15,7 @@ from apps.documents.services import AnalysisService
 
 
 class DocumentUploadView(APIView):
-    """POST /api/documents/upload/ — upload a PDF and return the forensics report."""
+    """POST /api/documents/upload/ — analyse in memory, nothing written to disk."""
 
     parser_classes = [MultiPartParser, FormParser]
     permission_classes = [AllowAny]
@@ -26,13 +26,12 @@ class DocumentUploadView(APIView):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        document = AnalysisService.create_from_upload(serializer.validated_data["file"])
+        # create_from_upload returns (document, raw_bytes) — no file saved
+        document, pdf_bytes = AnalysisService.create_from_upload(serializer.validated_data["file"])
 
         try:
-            report = AnalysisService.analyze_document(document)
+            report = AnalysisService.analyze_document(document, pdf_bytes)
         except Exception as exc:
-            document.status = Document.AnalysisStatus.FAILED
-            document.save(update_fields=["status", "updated_at"])
             return Response(
                 {"error": f"Analysis failed: {exc}"},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -61,3 +60,5 @@ class DocumentDetailView(RetrieveAPIView):
 
     def get_queryset(self):
         return Document.objects.select_related("analysis").all()
+    
+    
