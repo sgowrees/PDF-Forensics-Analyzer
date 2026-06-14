@@ -1,58 +1,44 @@
-import { useState } from 'react'
-import { uploadAndAnalyze } from './api/documents'
-import { AnalysisReport } from './components/AnalysisReport'
-import { FileUpload } from './components/FileUpload'
-import type { AnalysisResponse } from './types/analysis'
+import { Navigate, Route, Routes } from 'react-router-dom'
+import { useAuth } from './auth/AuthContext'
+import ProtectedRoute, { AdminRoute } from './auth/ProtectedRoute'
+import Login from './pages/Login'
+import Register from './pages/Register'
+import UserDashboard from './pages/UserDashboard'
+import AdminDashboard from './pages/AdminDashboard'
 import './App.css'
 
+function HomeRedirect() {
+  const { user, loading } = useAuth()
+
+  if (loading) return <p>Loading...</p>
+  if (!user) return <Navigate to="/login" replace />
+  if (user.role === 'admin') return <Navigate to="/admin" replace />
+  return <Navigate to="/dashboard" replace />
+}
+
 export default function App() {
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState<string | null>(null)
-  const [report, setReport] = useState<AnalysisResponse | null>(null)
-
-  async function handleUpload(file: File) {
-    setLoading(true)
-    setError(null)
-    setReport(null)
-
-    try {
-      const result = await uploadAndAnalyze(file)
-      setReport(result)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Upload failed')
-    } finally {
-      setLoading(false)
-    }
-  }
-
-  function handleReset() {
-    setReport(null)
-    setError(null)
-  }
-
   return (
-    <div className="app">
-      <header className="header">
-        <div>
-          <p className="eyebrow">PDF Forensics</p>
-          <h1>Document tamper analysis</h1>
-          <p className="lede">
-            Upload a PDF to compare it against trusted baselines and detect
-            structural, text, and layout changes.
-          </p>
-        </div>
-      </header>
-
-      <main className="main">
-        {!report && (
-          <>
-            <FileUpload onUpload={handleUpload} loading={loading} />
-            {error && <div className="error-banner">{error}</div>}
-          </>
-        )}
-
-        {report && <AnalysisReport report={report} onReset={handleReset} />}
-      </main>
-    </div>
+    <Routes>
+      <Route path="/" element={<HomeRedirect />} />
+      <Route path="/login" element={<Login />} />
+      <Route path="/register" element={<Register />} />
+      <Route
+        path="/dashboard"
+        element={
+          <ProtectedRoute>
+            <UserDashboard />
+          </ProtectedRoute>
+        }
+      />
+      <Route
+        path="/admin"
+        element={
+          <AdminRoute>
+            <AdminDashboard />
+          </AdminRoute>
+        }
+      />
+      <Route path="*" element={<Navigate to="/" replace />} />
+    </Routes>
   )
 }
