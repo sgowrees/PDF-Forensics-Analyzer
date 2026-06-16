@@ -9,6 +9,11 @@ __pycache__/
 
 
 
+templates/baselines/documents/*
+templates/baselines/documents/.gitkeep
+
+templates/documents/*
+templates/documents/.gitkeep
 
 
 
